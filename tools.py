@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,9 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+# Groq-hosted chat model used by the LLM tools. Swap here if needed.
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -69,8 +73,43 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Tokenize the description into lowercase keywords (ignore tiny words).
+    keywords = [w for w in re.findall(r"[a-z0-9]+", description.lower()) if len(w) > 2]
+
+    results = []
+    for item in listings:
+        # Filter: price ceiling.
+        if max_price is not None and item["price"] > max_price:
+            continue
+
+        # Filter: size (case-insensitive substring match, e.g. "M" in "S/M").
+        if size is not None and size.lower() not in item["size"].lower():
+            continue
+
+        # Score: keyword overlap against the searchable text. style_tags and
+        # title are the strongest signals, so weight them higher.
+        tags = " ".join(item["style_tags"]).lower()
+        title = item["title"].lower()
+        body = f"{item['description']} {item['category']}".lower()
+
+        score = 0
+        for kw in keywords:
+            if kw in tags:
+                score += 3
+            elif kw in title:
+                score += 2
+            elif kw in body:
+                score += 1
+
+        # Drop listings with no keyword overlap at all.
+        if score > 0:
+            results.append((score, item))
+
+    # Sort by score, highest first, and return just the listing dicts.
+    results.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in results]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +139,51 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_line = (
+        f"{new_item['title']} — {new_item['category']}, "
+        f"colors: {', '.join(new_item['colors'])}, "
+        f"style: {', '.join(new_item['style_tags'])}"
+    )
+
+    items = wardrobe.get("items", [])
+
+    if not items:
+        # Empty wardrobe: general styling advice, not an error.
+        prompt = (
+            "A user is considering buying this secondhand item:\n"
+            f"  {item_line}\n\n"
+            "They haven't added any wardrobe items yet. Give friendly, general "
+            "styling advice for this piece: what kinds of items pair well with it, "
+            "what vibe it suits, and how they might wear it. 2-4 sentences. "
+            "Start by noting they can add wardrobe items for personalized pairings."
+        )
+    else:
+        # Format the wardrobe so the model can name specific pieces.
+        wardrobe_lines = "\n".join(
+            f"  - {w['name']} ({w['category']}, {', '.join(w['colors'])})"
+            for w in items
+        )
+        prompt = (
+            "A user is considering buying this secondhand item:\n"
+            f"  {item_line}\n\n"
+            "Here is their current wardrobe:\n"
+            f"{wardrobe_lines}\n\n"
+            "Suggest 1-2 complete outfits that pair the new item with specific, "
+            "named pieces from their wardrobe. Refer to the wardrobe pieces by name. "
+            "Keep it concise and practical."
+        )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:
+        # Don't raise — let the pipeline continue to the fit card.
+        return f"(Styling suggestions are temporarily unavailable: {exc})"
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +215,36 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Guard: no usable outfit → return a descriptive string, never raise.
+    if not outfit or not outfit.strip():
+        return (
+            f"Couldn't generate a fit card — no outfit was available for "
+            f"{new_item['title']}. Here's the listing on its own: "
+            f"{new_item['title']}, ${new_item['price']:.2f} on {new_item['platform']}."
+        )
+
+    prompt = (
+        "Write a short, casual outfit caption (like a real OOTD post on "
+        "Instagram or TikTok — not a product description) for this thrifted find.\n\n"
+        f"Item: {new_item['title']}\n"
+        f"Price: ${new_item['price']:.2f}\n"
+        f"Platform: {new_item['platform']}\n"
+        f"Outfit: {outfit}\n\n"
+        "Requirements: 2-4 sentences. Mention the item name, price, and platform "
+        "naturally, once each. Capture the vibe in specific terms. Keep it authentic "
+        "and a little playful."
+    )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.9,  # higher temp so captions vary between runs
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:
+        return (
+            f"{new_item['title']} — ${new_item['price']:.2f} on "
+            f"{new_item['platform']}. (Caption generation unavailable: {exc})"
+        )

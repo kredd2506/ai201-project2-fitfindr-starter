@@ -14,3 +14,7 @@ env/
 
 # macOS
 .DS_Store
+
+# Personal working notes — not part of the submission
+notes.md
+
